@@ -42,7 +42,6 @@ from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Bool, String
 
-from nav_pkg.mic_asr import MicAsr
 from nav_pkg.nav_route import DEFAULT_AUDIO_ID, TourNavigator
 from nav_pkg.places import PlaceBook
 from nav_pkg.qwen import QwenClient
@@ -149,8 +148,7 @@ class TourChat(Node):
 
         self.declare_parameter("asr_topic", "/audio_asr/iat")
         self.declare_parameter("keyword_topic", "/audio_asr/keyword")
-        # 默认关掉平台 ASR，只用本地 faster-whisper small（不用唤醒）
-        self.declare_parameter("enable_asr", False)
+        self.declare_parameter("enable_asr", True)
         self.declare_parameter("enable_topic",
                                "/intelligent_interaction/lyre/enable")
         self.declare_parameter("chat_topic", "/tour/chat")
@@ -161,28 +159,6 @@ class TourChat(Node):
         self.declare_parameter("greet_text", DEFAULT_GREET)
         self.declare_parameter("min_chars", 2)
         self.declare_parameter("dedupe_window", 2.0)
-
-        # 本地麦克风识别（faster-whisper small）：不用平台唤醒，任意方向都能听
-        self.declare_parameter("enable_mic", True)
-        self.declare_parameter("mic_topic", "/lyre/audio_stream")
-        self.declare_parameter("mic_control_service", "/lyre/audio_control")
-        self.declare_parameter("mic_rate_in", 96000)
-        self.declare_parameter("vad_threshold", 600.0)
-        self.declare_parameter("vad_silence_s", 0.8)
-        self.declare_parameter("asr_model", "small")
-        self.declare_parameter("asr_compute_type", "int8")
-        self.declare_parameter("asr_language", "zh")
-        self.declare_parameter(
-            "asr_hotwords",
-            "乐知院、乐知教育、核心跑酷、核心力量跑酷、创想谷、厕所、卫生间、"
-            "洗手间、跆拳道馆、带我去、我想去、回到")
-        self.declare_parameter(
-            "asr_initial_prompt",
-            "以下是普通话的导览对话，常用地点：乐知院、核心力量跑酷、创想谷、"
-            "厕所、跆拳道馆。"
-            "可能的说法：我想去创想谷、带我去厕所、我想练跆拳道、"
-            "回乐知院、去核心力量跑酷。")
-        self.declare_parameter("asr_beam_size", 5)
 
         self.declare_parameter("qwen_base_url", "http://120.48.75.178:7006/v1")
         self.declare_parameter("qwen_model", "Qwen3.5-122B-A10B")
@@ -222,7 +198,6 @@ class TourChat(Node):
         self._awaiting = False
         self._last_spoken = ""
         self._speech_until = 0.0
-        self._mic = None
 
         self._qwen = QwenClient(
             base_url=str(self.get_parameter("qwen_base_url").value),
@@ -250,10 +225,9 @@ class TourChat(Node):
         self.create_subscription(
             AsrKeyword, str(self.get_parameter("keyword_topic").value),
             self._on_keyword, 10)
-        self._chat_topic = str(self.get_parameter("chat_topic").value)
-        self.create_subscription(String, self._chat_topic, self._on_chat, 10)
-        # 本地识别结果从这里回灌，走和 /tour/chat 完全相同的入口
-        self._chat_pub = self.create_publisher(String, self._chat_topic, 10)
+        self.create_subscription(
+            String, str(self.get_parameter("chat_topic").value),
+            self._on_chat, 10)
 
         # 平台 ASR 默认是关的（asr open status:0），必须持续使能，
         # 一旦停发就会被关回去，表现为「说话没有任何反应」。
@@ -262,24 +236,6 @@ class TourChat(Node):
             self._enable_pub = self.create_publisher(
                 Bool, str(self.get_parameter("enable_topic").value), 10)
             self.create_timer(0.5, self._publish_enable)
-
-        if bool(self.get_parameter("enable_mic").value):
-            self._mic = MicAsr(
-                self,
-                self._on_mic_text,
-                mic_topic=str(self.get_parameter("mic_topic").value),
-                control_service=str(self.get_parameter("mic_control_service").value),
-                rate_in=int(self.get_parameter("mic_rate_in").value),
-                vad_threshold=float(self.get_parameter("vad_threshold").value),
-                silence_s=float(self.get_parameter("vad_silence_s").value),
-                model_name=str(self.get_parameter("asr_model").value),
-                compute_type=str(self.get_parameter("asr_compute_type").value),
-                language=str(self.get_parameter("asr_language").value),
-                hotwords=str(self.get_parameter("asr_hotwords").value),
-                initial_prompt=str(self.get_parameter("asr_initial_prompt").value),
-                beam_size=int(self.get_parameter("asr_beam_size").value),
-            )
-            self._mic.start()
 
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
@@ -296,7 +252,6 @@ class TourChat(Node):
 
         self.get_logger().info(
             f"导览对话已就绪：导航={'开' if self._nav else '关'}，"
-            f"麦克风={'开' if self._mic else '关'}，"
             f"模型={self.get_parameter('qwen_model').value}")
 
     # ------------------------------------------------------------- 初始化
@@ -347,18 +302,17 @@ class TourChat(Node):
     def _on_chat(self, msg: String) -> None:
         self._enqueue(msg.data or "", "文本输入")
 
-    def _on_mic_text(self, text: str) -> None:
-        """本地识别在线程里回调，转成话题消息回灌，避免跨线程改状态。"""
-        msg = String()
-        msg.data = text or ""
-        self._chat_pub.publish(msg)
-
     def _enqueue(self, text: str, source: str) -> None:
         text = (text or "").strip()
         if not _meaningful(text, self._min_chars):
             return
-        if (self._navigating or self._speech.busy
-                or time.monotonic() < self._speech_until):
+        # 刚问完「现在还有什么事吗」时访客会马上回答：
+        # 只在播报结束后留 0.5 秒防尾音，不能像平时那样静默 2 秒，
+        # 否则「没有」这句话会被直接丢掉。
+        quiet_until = (self._speech_until - 1.5 if self._awaiting
+                       else self._speech_until)
+        quiet = time.monotonic() < quiet_until
+        if self._navigating or self._speech.busy or quiet:
             self.get_logger().info(f"忙（导航/播报）中忽略：{text}")
             self._file_log("忽略(忙)", text)
             return
@@ -530,15 +484,8 @@ class TourChat(Node):
             return
         self._last_spoken = text
         self._file_log("播报", text)
-        # 播报期间关掉麦克风识别，避免机器人听见自己的声音
-        if self._mic is not None:
-            self._mic.hold(True)
-        try:
-            self._speech_until = time.monotonic() + 2.0
-            self._speech.say(text)
-        finally:
-            if self._mic is not None:
-                self._mic.hold(False)
+        self._speech_until = time.monotonic() + 2.0
+        self._speech.say(text)
         # 播完再留 2 秒静默，等喇叭尾音和识别结果过去
         self._speech_until = time.monotonic() + 2.0
 
@@ -553,27 +500,18 @@ class TourChat(Node):
     def _greet(self, text: str) -> None:
         """开机自我介绍：直接播报，绝不走 _handle（自己的话不能当指令）。"""
         time.sleep(2.0)
-        if self._mic is not None:
-            self._mic.hold(True)
-        try:
-            for _ in range(3):
-                if self._speech.say(text):
-                    self._last_spoken = text
-                    self._file_log("播报", text)
-                    self._speech_until = time.monotonic() + 2.0
-                    return
-                time.sleep(2.0)
-        finally:
-            if self._mic is not None:
-                self._mic.hold(False)
+        for _ in range(3):
+            if self._speech.say(text):
+                self._last_spoken = text
+                self._file_log("播报", text)
+                self._speech_until = time.monotonic() + 2.0
+                return
+            time.sleep(2.0)
 
     def shutdown(self) -> None:
         self._closing = True
         self._queue.put(None)
         self._worker.join(timeout=2.0)
-        if self._mic is not None:
-            self._mic.stop()
-            self._mic = None
         # 还原本地现场：关闭语音识别
         if self._enable_pub is not None and rclpy.ok():
             msg = Bool()
@@ -591,8 +529,8 @@ _GO_WORDS = ("去", "到", "前往", "带我去", "领我去", "回", "走")
 _YES_WORDS = ("需要", "好啊", "好的", "好呀", "可以", "行", "带我去", "去吧",
               "麻烦", "要")
 _NO_WORDS = ("不用", "不需要", "不了", "算了", "暂时不", "先不", "别")
-_DONE_WORDS = ("没事", "没有了", "不用了", "没有别的", "没别的", "就这样",
-               "结束", "回去")
+_DONE_WORDS = ("没事", "没有", "没什么", "没啥", "没别的事", "不用了",
+               "就这样", "结束", "回去")
 
 
 def _plain(text: str) -> str:
