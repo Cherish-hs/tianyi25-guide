@@ -21,8 +21,11 @@ import os
 import sys
 import time
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
 
 sys.path.insert(0, os.environ.get("ROBOT_CONTROLLER_SRC",
                                  "/home/nvidia/robot_controller/src"))
@@ -39,6 +42,14 @@ ARRIVE_TOL_M = 1.0
 DEFAULT_TTS_SERVICE = "/intelligent_interaction/tts/play"
 DEFAULT_AUDIO_ID = "audio_guide"
 DEFAULT_POIS = "核心力量跑酷,创想谷,厕所,跆拳道馆"
+DEFAULT_DEPTH_TOPIC = "/ob_camera_head/depth/image_raw"
+
+
+class ObstacleBlocked(Exception):
+    """障碍物持续挡住轨道，需要尝试绕行。"""
+
+    def __init__(self, seconds):
+        super().__init__(f"障碍物持续 {seconds:.0f} 秒未移动")
 
 
 def unwrap_list(rv, *keys):
@@ -159,31 +170,26 @@ class Speaker:
 
 
 class ObstacleNotifier:
-    def __init__(self, log, speaker, text="请让一让", cooldown_s=15.0):
+    """只负责检测底盘是否因障碍物停车，提示由调用方控制。"""
+
+    def __init__(self, log):
         self._log = log
-        self._speaker = speaker
-        self._text = text
-        self._cooldown_s = cooldown_s
-        self._last = 0.0
         self._blocked = False
 
     def check(self, chassis):
+        """返回底盘当前是否因障碍物停车。"""
         try:
             health = chassis.get_robot_health()
         except Exception:  # noqa: BLE001
-            return
+            return False
         codes = {int(entry.id) for entry in (health.baseError or [])}
         if OBSTACLE_STOP_DTC not in codes:
             self._blocked = False
-            return
-        now = time.monotonic()
-        if self._blocked and now - self._last < self._cooldown_s:
-            return
+            return False
+        if not self._blocked:
+            self._log.warn("检测到前方障碍物，底盘已停车")
         self._blocked = True
-        self._last = now
-        self._log.warn("检测到前方障碍物，底盘已停车")
-        if self._speaker is not None:
-            self._speaker.say(self._text)
+        return True
 
 
 class TourNavigator:
@@ -195,15 +201,35 @@ class TourNavigator:
 
     def __init__(self, node, host="192.168.11.10", rest_port=9090,
                  map_name="消防", reloc_poi="", track="", timeout=180.0,
-                 speaker=None, obstacle_text="请让一让"):
+                 speaker=None, obstacle_text="正在执行任务，请让一让",
+                 detour_enabled=True, detour_after_s=1.0,
+                 detour_side_m=0.4, detour_fwd_m=0.6,
+                 detour_clear_m=1.0, detour_max_tries=2,
+                 detour_side_sign=1.0,
+                 depth_topic=DEFAULT_DEPTH_TOPIC, file_log=None):
         self._log = node.get_logger()
+        self._file_log = file_log if callable(file_log) else (lambda *_: None)
         self._host = str(host)
         self._rest_port = int(rest_port)
         self._map_name = str(map_name or "")
         self._reloc_poi = str(reloc_poi or "")
         self._track = str(track or "")
         self._timeout = float(timeout)
-        self._notifier = ObstacleNotifier(self._log, speaker, obstacle_text)
+        self._notifier = ObstacleNotifier(self._log)
+        self._speaker = speaker
+        self._obstacle_text = str(obstacle_text or "正在执行任务，请让一让")
+        self._detour_enabled = bool(detour_enabled)
+        self._detour_after_s = max(1.0, float(detour_after_s))
+        self._detour_side_m = max(0.1, min(0.5, float(detour_side_m)))
+        self._detour_fwd_m = max(0.1, min(1.0, float(detour_fwd_m)))
+        self._detour_clear_m = max(0.3, float(detour_clear_m))
+        self._detour_max_tries = max(0, int(detour_max_tries))
+        self._detour_side_sign = 1.0 if float(detour_side_sign) >= 0 else -1.0
+        self._depth = None
+        if self._detour_enabled:
+            node.create_subscription(
+                Image, str(depth_topic), self._on_depth,
+                qos_profile_sensor_data)
         self._chassis = None
         self._track_ids = {}
         self._ready = False
@@ -340,11 +366,29 @@ class TourNavigator:
         self._ready = True
         return True
 
-    def _wait_action(self, label, action_id, timeout_s):
+    def _wait_action(self, label, action_id, timeout_s,
+                     allow_detour=False, notify=True):
         deadline = time.monotonic() + timeout_s
         last = None
+        blocked_since = None
         while time.monotonic() < deadline:
-            self._notifier.check(self._chassis)
+            if allow_detour:
+                blocked = (self._notifier.check(self._chassis) if notify
+                           else self._is_blocked())
+                if blocked:
+                    if blocked_since is None:
+                        if notify:
+                            self._prompt_obstacle()
+                        blocked_since = (time.monotonic()
+                                         if self._is_blocked() else None)
+                    elif (time.monotonic() - blocked_since
+                          >= self._detour_after_s):
+                        self._chassis.cancel_action([action_id])
+                        raise ObstacleBlocked(time.monotonic() - blocked_since)
+                else:
+                    blocked_since = None
+            elif notify:
+                self._notifier.check(self._chassis)
             status = self._chassis.get_action_status(action_id)
             if status != last:
                 self._log.info(f"  {label}：{status}")
@@ -361,27 +405,156 @@ class TourNavigator:
         self._chassis.cancel_action([action_id])
         raise TimeoutError(f"{label} 超时（{timeout_s}s），已请求取消")
 
-    def _goto(self, target, track_id, timeout_s, map_name):
-        if track_id is None:
-            self._log.info(f"点对点前往 {target}")
-            rv = self._chassis.move_to_poi(poi_name=target)
-        else:
-            self._log.info(f"沿轨道 {track_id} 前往 {target}")
-            rv = self._chassis.move_to_locations_poi(
-                track_id, target, uptrack_enabled=True)
+    def _is_blocked(self):
         try:
-            self._wait_action(target, str(rv.get("action_id")), timeout_s)
-        except (RuntimeError, TimeoutError):
-            pose = self._chassis.get_pose() or {}
-            goal = poi_pose(self._chassis, target, map_name=map_name)
-            if goal and pose.get("x") is not None:
-                dist = math.hypot(pose["x"] - goal[0], pose["y"] - goal[1])
-                if dist <= ARRIVE_TOL_M:
-                    self._log.warn(
-                        f"底盘回报失败，但已在 {target} 附近"
-                        f"（偏差 {dist:.2f}m），按到点继续")
-                    return
-            raise
+            health = self._chassis.get_robot_health()
+        except Exception:  # noqa: BLE001
+            return False
+        return OBSTACLE_STOP_DTC in {
+            int(entry.id) for entry in (health.baseError or [])}
+
+    def _speak(self, text):
+        if self._speaker is None:
+            return
+        try:
+            self._speaker.say(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _prompt_obstacle(self):
+        """播报两次提示，间隔 1 秒；障碍已移开则提前结束。"""
+        for i in range(2):
+            if i:
+                time.sleep(1.0)
+            if not self._is_blocked():
+                return
+            self._speak(self._obstacle_text)
+            self._file_log("障碍", self._obstacle_text)
+
+    def _on_depth(self, msg):
+        self._depth = msg
+
+    def _side_clearance(self):
+        """从头部深度图估计左右两侧的可用净空（米）。
+
+        取画面中间高度带，左右各取一段区域，用 10% 分位数代表
+        该侧最近的障碍距离；没有有效深度时返回 None。
+        """
+        img = self._depth
+        if img is None or img.encoding != "16UC1":
+            return None
+        h, w = int(img.height), int(img.width)
+        if h <= 0 or w <= 0:
+            return None
+        data = np.frombuffer(bytes(img.data), dtype=np.uint16)
+        if data.size < h * w:
+            return None
+        depth = data[:h * w].reshape(h, w).astype(np.float32) * 0.001
+        band = depth[int(h * 0.35):int(h * 0.65)]
+        if band.size == 0:
+            return None
+        left = band[:, int(w * 0.10):int(w * 0.45)]
+        right = band[:, int(w * 0.55):int(w * 0.90)]
+
+        def _free(region):
+            vals = region[region > 0.1]
+            if vals.size == 0:
+                return 0.0
+            return float(np.percentile(vals, 10))
+
+        return _free(left), _free(right)
+
+    def _detour(self, target):
+        """从障碍物旁边小步绕行：先侧移，再前进，随后由调用方重新上轨。"""
+        sides = self._side_clearance()
+        if sides is None:
+            self._log.warn("绕行失败：没有可用的头部深度图")
+            self._file_log("绕行", "失败：没有可用的深度图")
+            self._speak("前面有障碍，我看不清两边，先停一下等一等")
+            return False
+        left_m, right_m = sides
+        side = 1.0 if left_m >= right_m else -1.0
+        free_m = max(left_m, right_m)
+        self._log.warn(
+            f"绕行评估 {target}：左 {left_m:.2f}m / 右 {right_m:.2f}m，"
+            f"需要净空 {self._detour_clear_m:.2f}m")
+        self._file_log(
+            "绕行评估",
+            f"{target} 左 {left_m:.2f}m / 右 {right_m:.2f}m")
+        if free_m < self._detour_clear_m:
+            self._file_log(
+                "绕行", f"放弃：净空 {free_m:.2f}m < {self._detour_clear_m:.2f}m")
+            self._speak("两边空间不够，我先停一下，请让一让")
+            return False
+        side_name = "左" if side > 0 else "右"
+        self._speak("前面有人挡路，我从旁边绕一下")
+        self._log.warn(
+            f"绕行：向{side_name}侧移 {self._detour_side_m:.2f}m，"
+            f"再前进 {self._detour_fwd_m:.2f}m")
+        self._file_log(
+            "绕行",
+            f"向{side_name}侧移 {self._detour_side_m:.2f}m，"
+            f"前进 {self._detour_fwd_m:.2f}m")
+        try:
+            rv = self._chassis.move_by(
+                direction=side * self._detour_side_sign * math.pi / 2,
+                distance=int(self._detour_side_m * 1000),
+                move_mode=0, v=0.2)
+            self._wait_action("绕行侧移", str(rv.get("action_id")),
+                              25.0, notify=False)
+            rv = self._chassis.move_by(
+                direction=0.0,
+                distance=int(self._detour_fwd_m * 1000),
+                move_mode=0, v=0.2)
+            self._wait_action("绕行前进", str(rv.get("action_id")),
+                              25.0, notify=False)
+        except Exception as exc:  # noqa: BLE001 - 绕行失败就停车等待
+            self._log.error(f"绕行动作失败：{exc}")
+            self._file_log("绕行", f"动作失败：{exc}")
+            self._speak("旁边过不去，我先停一下")
+            return False
+        return True
+
+    def _goto(self, target, track_id, timeout_s, map_name):
+        detours = 0
+        while True:
+            if track_id is None:
+                self._log.info(f"点对点前往 {target}")
+                rv = self._chassis.move_to_poi(poi_name=target)
+            else:
+                self._log.info(f"沿轨道 {track_id} 前往 {target}")
+                rv = self._chassis.move_to_locations_poi(
+                    track_id, target, uptrack_enabled=True)
+            try:
+                self._wait_action(
+                    target, str(rv.get("action_id")), timeout_s,
+                    allow_detour=self._detour_enabled)
+                break
+            except ObstacleBlocked as exc:
+                if detours >= self._detour_max_tries:
+                    raise RuntimeError(
+                        f"{target} 被障碍物挡住，绕行 {detours} 次仍未通过"
+                    ) from exc
+                detours += 1
+                self._log.warn(
+                    f"{exc}，第 {detours}/{self._detour_max_tries} 次尝试绕行")
+                self._file_log(
+                    "绕行",
+                    f"第 {detours}/{self._detour_max_tries} 次：{exc}")
+                if not self._detour(target):
+                    raise RuntimeError(
+                        f"{target} 附近空间不足，放弃绕行") from exc
+            except (RuntimeError, TimeoutError):
+                pose = self._chassis.get_pose() or {}
+                goal = poi_pose(self._chassis, target, map_name=map_name)
+                if goal and pose.get("x") is not None:
+                    dist = math.hypot(pose["x"] - goal[0], pose["y"] - goal[1])
+                    if dist <= ARRIVE_TOL_M:
+                        self._log.warn(
+                            f"底盘回报失败，但已在 {target} 附近"
+                            f"（偏差 {dist:.2f}m），按到点继续")
+                        return
+                raise
         pose = self._chassis.get_pose() or {}
         self._log.info(f"到达 {target}，当前位置 x={pose.get('x')} "
                        f"y={pose.get('y')} yaw={pose.get('yaw')}")
@@ -438,7 +611,15 @@ class NavRoute(Node):
         self.declare_parameter("pose", "")
         self.declare_parameter("force_reloc", False)
         self.declare_parameter("timeout", 180.0)
-        self.declare_parameter("obstacle_text", "请让一让")
+        self.declare_parameter("obstacle_text", "正在执行任务，请让一让")
+        self.declare_parameter("detour_enabled", True)
+        self.declare_parameter("detour_after_s", 1.0)
+        self.declare_parameter("detour_side_m", 0.4)
+        self.declare_parameter("detour_fwd_m", 0.6)
+        self.declare_parameter("detour_clear_m", 1.0)
+        self.declare_parameter("detour_max_tries", 2)
+        self.declare_parameter("detour_side_sign", 1.0)
+        self.declare_parameter("depth_topic", DEFAULT_DEPTH_TOPIC)
         self.declare_parameter("enable_voice", True)
         self._log = self.get_logger()
         self._nav = None
@@ -499,6 +680,14 @@ class NavRoute(Node):
             timeout=self._param("timeout"),
             speaker=self._speaker,
             obstacle_text=self._param("obstacle_text"),
+            detour_enabled=bool(self._param("detour_enabled")),
+            detour_after_s=float(self._param("detour_after_s")),
+            detour_side_m=float(self._param("detour_side_m")),
+            detour_fwd_m=float(self._param("detour_fwd_m")),
+            detour_clear_m=float(self._param("detour_clear_m")),
+            detour_max_tries=int(self._param("detour_max_tries")),
+            detour_side_sign=float(self._param("detour_side_sign")),
+            depth_topic=str(self._param("depth_topic")),
         )
         self._nav.connect()
 

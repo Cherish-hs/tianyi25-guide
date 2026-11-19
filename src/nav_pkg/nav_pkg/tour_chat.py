@@ -42,7 +42,8 @@ from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Bool, String
 
-from nav_pkg.nav_route import DEFAULT_AUDIO_ID, TourNavigator
+from nav_pkg.nav_route import (
+    DEFAULT_AUDIO_ID, DEFAULT_DEPTH_TOPIC, TourNavigator)
 from nav_pkg.places import PlaceBook
 from nav_pkg.qwen import QwenClient
 
@@ -174,7 +175,15 @@ class TourChat(Node):
         self.declare_parameter("reloc_poi", "乐知教育")
         self.declare_parameter("track", "track_line_1003")
         self.declare_parameter("nav_timeout", 180.0)
-        self.declare_parameter("obstacle_text", "请让一让")
+        self.declare_parameter("obstacle_text", "正在执行任务，请让一让")
+        self.declare_parameter("detour_enabled", True)
+        self.declare_parameter("detour_after_s", 1.0)
+        self.declare_parameter("detour_side_m", 0.4)
+        self.declare_parameter("detour_fwd_m", 0.6)
+        self.declare_parameter("detour_clear_m", 1.0)
+        self.declare_parameter("detour_max_tries", 2)
+        self.declare_parameter("detour_side_sign", 1.0)
+        self.declare_parameter("depth_topic", DEFAULT_DEPTH_TOPIC)
         self.declare_parameter("places_file", "")
         self.declare_parameter("log_file", "")
 
@@ -272,6 +281,22 @@ class TourChat(Node):
                 timeout=float(self.get_parameter("nav_timeout").value),
                 speaker=self._speech,
                 obstacle_text=str(self.get_parameter("obstacle_text").value),
+                detour_enabled=bool(
+                    self.get_parameter("detour_enabled").value),
+                detour_after_s=float(
+                    self.get_parameter("detour_after_s").value),
+                detour_side_m=float(
+                    self.get_parameter("detour_side_m").value),
+                detour_fwd_m=float(
+                    self.get_parameter("detour_fwd_m").value),
+                detour_clear_m=float(
+                    self.get_parameter("detour_clear_m").value),
+                detour_max_tries=int(
+                    self.get_parameter("detour_max_tries").value),
+                detour_side_sign=float(
+                    self.get_parameter("detour_side_sign").value),
+                depth_topic=str(self.get_parameter("depth_topic").value),
+                file_log=self._file_log,
             )
             self._nav.connect()
             self._places = PlaceBook.load(
@@ -449,6 +474,7 @@ class TourChat(Node):
             self._nav.goto(place.poi)
         except Exception as exc:  # noqa: BLE001 - 导航失败只提示，不退出节点
             self.get_logger().error(f"导航失败：{exc}")
+            self._file_log("导航失败", f"{place.poi}：{exc}")
             self._speak("抱歉，这次没能带你去，底盘导航没有完成")
             return
         finally:
