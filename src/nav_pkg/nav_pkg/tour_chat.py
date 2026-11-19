@@ -184,6 +184,7 @@ class TourChat(Node):
         self.declare_parameter("greet_text", DEFAULT_GREET)
         self.declare_parameter("min_chars", 2)
         self.declare_parameter("dedupe_window", 2.0)
+        self.declare_parameter("idle_return_s", 30.0)
 
         self.declare_parameter("qwen_base_url", "http://120.48.75.178:7006/v1")
         self.declare_parameter("qwen_model", "Qwen3.5-122B-A10B")
@@ -230,6 +231,8 @@ class TourChat(Node):
         self._navigating = False
         self._pending = None
         self._awaiting = False
+        self._last_interaction = 0.0
+        self._idle_s = float(self.get_parameter("idle_return_s").value)
         self._last_spoken = ""
         self._speech_until = 0.0
 
@@ -300,6 +303,10 @@ class TourChat(Node):
 
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
+
+        # 到点后长时间没人说话就自己回待命点
+        if self._idle_s > 0:
+            threading.Thread(target=self._idle_loop, daemon=True).start()
 
         greet = ""
         if bool(self.get_parameter("enable_greet").value):
@@ -488,6 +495,7 @@ class TourChat(Node):
         if key == self._last_key and now - self._last_at < self._dedupe_window:
             return
         self._last_key, self._last_at = key, now
+        self._last_interaction = now
         self.get_logger().info(f"{source}：{text}")
         self._file_log(source, text)
         self._queue.put(text)
@@ -501,10 +509,44 @@ class TourChat(Node):
                 continue
             if text is None:
                 return
+            if text == _IDLE:
+                self._handle_idle()
+                continue
             try:
                 self._handle(text)
             except Exception as exc:  # noqa: BLE001 - 单次失败不影响后续对话
                 self.get_logger().error(f"处理失败：{exc}")
+
+    def _idle_loop(self) -> None:
+        """到点后超过 idle_return_s 没人说话，就自己回待命点。"""
+        while not self._closing:
+            time.sleep(1.0)
+            if self._navigating or not self._awaiting:
+                continue
+            if not self._last_interaction:
+                continue
+            if time.monotonic() - self._last_interaction < self._idle_s:
+                continue
+            if self._places is None or self._places.standby is None:
+                continue
+            self._queue.put(_IDLE)
+            time.sleep(1.0)
+
+    def _handle_idle(self) -> None:
+        if self._navigating or not self._awaiting:
+            return
+        if not self._last_interaction:
+            return
+        # 队列里的超时哨兵可能是旧的，处理时再核对一次时间
+        if time.monotonic() - self._last_interaction < self._idle_s:
+            return
+        standby = self._places.standby if self._places is not None else None
+        if standby is None:
+            return
+        self._file_log("超时", f"{self._idle_s:.0f} 秒无人交互，回待命点")
+        self._navigate(
+            standby, standby=True,
+            depart_text="没什么事了吧，我先回去了")
 
     def _handle(self, text: str) -> None:
         if self._nav is not None and not self._navigating:
@@ -515,7 +557,7 @@ class TourChat(Node):
                 # 只认短指令，长串闲聊/回声不触发导航
                 if _explicit_go(text) and len(_plain(text)) <= 20:
                     self._pending = None
-                    self._navigate(place)
+                    self._navigate(place, standby=self._is_standby(place))
                     return
                 self._pending = place
                 self._speak(f"可以去{place.spoken}，需要我带你去吗？")
@@ -528,7 +570,7 @@ class TourChat(Node):
                     self._speak("好的，想去的时候随时叫我")
                     return
                 if _means_yes(text):
-                    self._navigate(pending)
+                    self._navigate(pending, standby=self._is_standby(pending))
                     return
 
             # 3) 到地方后问「还有什么事」，说没事就回待命点
@@ -593,16 +635,25 @@ class TourChat(Node):
         return place, (reply or f"可以去{place.spoken}，需要我带你去吗？")
 
     # ------------------------------------------------------------------ 导航
-    def _navigate(self, place, standby: bool = False) -> None:
+    def _is_standby(self, place) -> bool:
+        standby = self._places.standby if self._places is not None else None
+        return bool(standby and place.poi == standby.poi)
+
+    def _navigate(self, place, standby: bool = False,
+                  depart_text: str = "") -> None:
         self._navigating = True
         self._drain_queue()
         try:
             ok, message = self._nav.check_ready()
             if not ok:
                 self._speak(message)
+                if standby:
+                    self._last_interaction = time.monotonic()
                 return
             target = place.spoken
-            if not standby:
+            if standby:
+                self._speak(depart_text or "好的，我这就回去")
+            else:
                 self._speak(f"好的，我这就带你去{target}")
             self.get_logger().info(
                 f"开始导航：{place.poi}（{target}，"
@@ -614,16 +665,22 @@ class TourChat(Node):
             self.get_logger().error(f"导航失败：{exc}")
             self._file_log("导航失败", f"{place.poi}：{exc}")
             self._speak("抱歉，这次没能带你去，底盘导航没有完成")
+            if standby:
+                self._last_interaction = time.monotonic()
             return
         finally:
             self._navigating = False
 
         if standby:
             self._awaiting = False
-            self._speak(f"好的，我已经回到{place.spoken}待命，有事随时叫我")
+            self._speak(f"到了，我回到{place.spoken}待命了，有事随时叫我")
         else:
+            # 先刷新时间再置 awaiting，避免到点生成/播报期间被超时线程误判
+            self._last_interaction = time.monotonic()
             self._awaiting = True
             self._speak(self._arrival_line(place.spoken))
+            # 从问完「还有什么事吗」开始计时，30 秒没人理就自己回去
+            self._last_interaction = time.monotonic()
 
     def _arrival_line(self, target: str) -> str:
         try:
@@ -717,6 +774,8 @@ _YES_WORDS = ("需要", "好啊", "好的", "好呀", "可以", "行", "带我�
 _NO_WORDS = ("不用", "不需要", "不了", "算了", "暂时不", "先不", "别")
 _DONE_WORDS = ("没事", "没有", "没什么", "没啥", "没别的事", "不用了",
                "就这样", "结束", "回去")
+# 工作线程内部使用的哨兵：到点后超时无人交互
+_IDLE = "\x00idle"
 
 
 def _plain(text: str) -> str:

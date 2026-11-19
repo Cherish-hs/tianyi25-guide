@@ -515,12 +515,11 @@ class TourNavigator:
             return False
         return True
 
-    def _goto(self, target, track_id, timeout_s, map_name):
+    def _goto(self, target, track_id, timeout_s, map_name, goal=None):
         detours = 0
         while True:
             if track_id is None:
-                self._log.info(f"点对点前往 {target}")
-                rv = self._chassis.move_to_poi(poi_name=target)
+                rv = self._start_point_nav(target, goal)
             else:
                 self._log.info(f"沿轨道 {track_id} 前往 {target}")
                 rv = self._chassis.move_to_locations_poi(
@@ -559,33 +558,57 @@ class TourNavigator:
         self._log.info(f"到达 {target}，当前位置 x={pose.get('x')} "
                        f"y={pose.get('y')} yaw={pose.get('yaw')}")
 
-    def goto(self, name, track=None, timeout=None, turn=False):
-        """前往点位；track 留空用构造时的默认轨道，显式传""走点对点。
+    def _start_point_nav(self, target, goal):
+        """点对点下发：目标朝向统一取本次行进方向，避免与点位朝向冲突。"""
+        if not goal:
+            self._log.info(f"点对点前往 {target}")
+            return self._chassis.move_to_poi(poi_name=target, flags=1)
+        pose = self._chassis.get_pose() or {}
+        if pose.get("x") is None:
+            heading = 0.0
+        else:
+            heading = math.atan2(
+                goal[1] - pose["y"], goal[0] - pose["x"])
+        self._log.info(
+            f"点对点前往 {target}（朝向 {math.degrees(heading):+.0f}°）")
+        self._file_log("导航", f"{target} 朝向 {math.degrees(heading):+.0f}°")
+        return self._chassis.move_to(
+            goal[0], goal[1], yaw=heading, flags=1)
 
-        turn=True 时先原地转向目标点位，避免返程倒着开回去。
-        """
+    def goto(self, name, track=None, timeout=None, turn=False):
+        """前往点位；点对点时统一用“本次行进朝向”，不再用点位固定朝向。"""
         if self._chassis is None:
             self.connect()
         self.ensure_map()
         track_name = self._track if track is None else str(track)
         track_id = self._track_id(track_name)
         timeout_s = self._timeout if timeout is None else float(timeout)
+        goal = None
+        heading = None
+        if track_id is None:
+            goal, heading = self._goal_and_heading(name)
         self._chassis.set_aeb_control("On")
-        if turn:
-            self.turn_toward(name)
-        self._goto(name, track_id, timeout_s, self._map_name)
+        if turn and heading is not None:
+            self.turn_toward(name, heading)
+        self._goto(name, track_id, timeout_s, self._map_name, goal=goal)
         return True
 
-    def turn_toward(self, name):
-        """原地转向目标点位；只要目标在身后就先掉头，避免倒车。"""
+    def _goal_and_heading(self, name):
+        """返回目标坐标和当前位姿到目标的行进朝向。"""
         pose = self.pose() or {}
         goal = poi_pose(self._chassis, name, map_name=self._map_name)
         if not goal or pose.get("x") is None:
-            return
+            return goal, None
+        heading = math.atan2(goal[1] - pose["y"], goal[0] - pose["x"])
+        return goal, heading
+
+    def turn_toward(self, name, heading):
+        """转到本次行进朝向；失败或转不到位就抛错停车，不继续前进。"""
+        pose = self.pose() or {}
         yaw = float(pose.get("yaw") or 0.0)
-        target = math.atan2(goal[1] - pose["y"], goal[0] - pose["x"])
-        delta = math.atan2(math.sin(target - yaw), math.cos(target - yaw))
-        # 小于 90° 说明目标在侧前方，交给底盘自己走；超过 90° 才先掉头
+        delta = math.atan2(
+            math.sin(heading - yaw), math.cos(heading - yaw))
+        # 目标在侧前方（<90°）时没必要原地转，交给底盘边走边转
         if abs(delta) < math.radians(90.0):
             return
         self._log.info(f"先转向 {name}：{math.degrees(delta):+.0f}°")
@@ -595,8 +618,20 @@ class TourNavigator:
         try:
             self._wait_action("转向", str(rv.get("action_id")), 20.0,
                               notify=False)
-        except Exception as exc:  # noqa: BLE001 - 转向失败不阻断返程
-            self._log.warn(f"转向失败，继续导航：{exc}")
+        except Exception as exc:  # noqa: BLE001 - 转不过去就停止
+            raise RuntimeError(f"转向失败，已停止：{exc}") from exc
+
+        # 核对实际朝向，防止转向动作“成功”但车头没到位
+        error = delta
+        for _ in range(6):
+            time.sleep(0.25)
+            now = float((self.pose() or {}).get("yaw") or 0.0)
+            error = math.atan2(
+                math.sin(heading - now), math.cos(heading - now))
+            if abs(error) <= math.radians(15.0):
+                return
+        raise RuntimeError(
+            f"转向未到位（偏差 {math.degrees(error):+.0f}°），已停止")
 
     def list_all(self):
         map_name = self._map_name
