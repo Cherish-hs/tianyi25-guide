@@ -559,8 +559,11 @@ class TourNavigator:
         self._log.info(f"到达 {target}，当前位置 x={pose.get('x')} "
                        f"y={pose.get('y')} yaw={pose.get('yaw')}")
 
-    def goto(self, name, track=None, timeout=None):
-        """前往点位；track 留空用构造时的默认轨道，显式传""走点对点。"""
+    def goto(self, name, track=None, timeout=None, turn=False):
+        """前往点位；track 留空用构造时的默认轨道，显式传""走点对点。
+
+        turn=True 时先原地转向目标点位，避免返程倒着开回去。
+        """
         if self._chassis is None:
             self.connect()
         self.ensure_map()
@@ -568,8 +571,32 @@ class TourNavigator:
         track_id = self._track_id(track_name)
         timeout_s = self._timeout if timeout is None else float(timeout)
         self._chassis.set_aeb_control("On")
+        if turn:
+            self.turn_toward(name)
         self._goto(name, track_id, timeout_s, self._map_name)
         return True
+
+    def turn_toward(self, name):
+        """原地转向目标点位；只要目标在身后就先掉头，避免倒车。"""
+        pose = self.pose() or {}
+        goal = poi_pose(self._chassis, name, map_name=self._map_name)
+        if not goal or pose.get("x") is None:
+            return
+        yaw = float(pose.get("yaw") or 0.0)
+        target = math.atan2(goal[1] - pose["y"], goal[0] - pose["x"])
+        delta = math.atan2(math.sin(target - yaw), math.cos(target - yaw))
+        # 小于 90° 说明目标在侧前方，交给底盘自己走；超过 90° 才先掉头
+        if abs(delta) < math.radians(90.0):
+            return
+        self._log.info(f"先转向 {name}：{math.degrees(delta):+.0f}°")
+        self._file_log("转向", f"{name} {math.degrees(delta):+.0f}°")
+        rv = self._chassis.move_by(
+            direction=delta, distance=0, move_mode=1)
+        try:
+            self._wait_action("转向", str(rv.get("action_id")), 20.0,
+                              notify=False)
+        except Exception as exc:  # noqa: BLE001 - 转向失败不阻断返程
+            self._log.warn(f"转向失败，继续导航：{exc}")
 
     def list_all(self):
         map_name = self._map_name

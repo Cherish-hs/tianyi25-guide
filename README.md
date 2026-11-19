@@ -93,20 +93,22 @@ ros2 run nav_pkg tour_chat --ros-args \
   -p qwen_base_url:=http://127.0.0.1:8000/v1
 ```
 
+> `track` 默认为空，走**点对点**，途中经过其它点位不会停；只有显式设置 `track_line_1003` 才沿轨道行驶。去任何点位前都会先判断方向：目标在车身后方（夹角超过 90°）就先原地掉头再前进，不会倒着开，包括从厕所回创想谷这种“原路返回”的情况。
+
 ## 语音识别（ASR）
 
-当前使用**平台讯飞 AIUI 的 ASR**，不是本地 whisper。
+默认使用**本地 faster-whisper（small / int8）**，不需要唤醒，前后左右都能听；也可以切回平台 AIUI。
 
-| 项 | 说明 |
-|---|---|
-| 识别结果 | 订阅 `/audio_asr/iat`（`lyre_msgs/AsrIat`） |
-| 使能 | 每 0.5 秒向 `/intelligent_interaction/lyre/enable` 发 `true` |
-| 唤醒 | 人脸唤醒，`/audio_asr/keyword` 仅记录日志 |
-| 拾音范围 | 4 麦线性阵列，正前方约 ±45°，侧后方无效 |
+| 项 | 本地模式（默认） | 平台模式 |
+|---|---|---|
+| 开关 | `enable_mic:=true` | `enable_mic:=false`（`enable_asr` 自动为 true 需手动设） |
+| 识别来源 | 订阅 `/lyre/audio_stream`，96k 重采样到 16k | 订阅 `/audio_asr/iat` |
+| 唤醒 | 不需要，能量 VAD 自动断句 | 语音唤醒词「小田」+ 人脸 |
+| 使能 | 无需心跳 | 每 0.5 秒向 `/intelligent_interaction/lyre/enable` 发 `true` |
 
-关键点：平台 ASR **默认关闭**，业务节点必须持续发使能心跳，停发即被关回，表现为“说话毫无反应”。退出时节点会发 `false` 还原现场。
+本地模式用能量 VAD 断句（0.4 秒起说、0.8 秒静音收句、最长 12 秒），播报期间自动静音麦克风，避免机器人听见自己。
 
-> 历史提交中曾尝试本地 faster-whisper 识别，该实现已移除，相关参数（`enable_mic` 等）不再存在。
+> 唤醒词通过 `/audio_aiui/wake_word_control` 在运行时登记，**不修改** `/opt/PARTITIONS/.../aiui_params.yaml`；只在平台模式下登记，节点退出时还原。
 
 ## 交互流程
 
@@ -127,7 +129,10 @@ ros2 run nav_pkg tour_chat --ros-args \
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `asr_topic` | `/audio_asr/iat` | 平台识别结果 |
-| `enable_asr` | `True` | 是否发 ASR 使能心跳 |
+| `enable_asr` | `False` | 平台 ASR 使能心跳（本地模式关闭） |
+| `enable_mic` | `True` | 本地麦克风识别开关 |
+| `mic_topic` | `/lyre/audio_stream` | 原始音频 |
+| `asr_model` / `asr_compute_type` | `small` / `int8` | faster-whisper 模型 |
 | `chat_topic` | `/tour/chat` | 文本直连 |
 | `tts_service` | `/intelligent_interaction/tts/play` | 播报服务 |
 | `enable_voice` | `True` | 是否启用 TTS |
@@ -141,8 +146,9 @@ ros2 run nav_pkg tour_chat --ros-args \
 | `enable_nav` | `True` | 是否启用导航 |
 | `host` / `rest_port` | `192.168.11.10` / `9090` | 底盘 REST |
 | `map` | `消防` | 地图名 |
+| `wake_word` | `小田` | 运行时登记的语音唤醒词，留空则不登记 |
 | `reloc_poi` | `乐知教育` | 重定位参考点 |
-| `track` | `track_line_1003` | 虚拟轨道 |
+| `track` | `""`（点对点） | 虚拟轨道；设为 `track_line_1003` 恢复轨道导航 |
 | `nav_timeout` | `180.0` | 单次导航超时 |
 | `detour_enabled` | `True` | 障碍长时间不动时是否尝试小步绕行 |
 | `detour_after_s` | `1.0` | 两遍提示后仍被挡，再等多少秒就绕行 |

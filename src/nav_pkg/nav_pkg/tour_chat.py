@@ -42,6 +42,7 @@ from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Bool, String
 
+from nav_pkg.mic_asr import MicAsr
 from nav_pkg.nav_route import (
     DEFAULT_AUDIO_ID, DEFAULT_DEPTH_TOPIC, TourNavigator)
 from nav_pkg.places import PlaceBook
@@ -149,7 +150,30 @@ class TourChat(Node):
 
         self.declare_parameter("asr_topic", "/audio_asr/iat")
         self.declare_parameter("keyword_topic", "/audio_asr/keyword")
-        self.declare_parameter("enable_asr", True)
+        self.declare_parameter("wake_word", "小田")
+
+        # 本地麦克风识别（faster-whisper）：不用唤醒，任意方向都能听
+        self.declare_parameter("enable_mic", True)
+        self.declare_parameter("mic_topic", "/lyre/audio_stream")
+        self.declare_parameter("mic_control_service", "/lyre/audio_control")
+        self.declare_parameter("mic_rate_in", 96000)
+        self.declare_parameter("vad_threshold", 600.0)
+        self.declare_parameter("vad_silence_s", 0.8)
+        self.declare_parameter("asr_model", "small")
+        self.declare_parameter("asr_compute_type", "int8")
+        self.declare_parameter("asr_language", "zh")
+        self.declare_parameter(
+            "asr_hotwords",
+            "乐知院、乐知教育、核心跑酷、核心力量跑酷、创想谷、厕所、卫生间、"
+            "洗手间、跆拳道馆、带我去、我想去、回到")
+        self.declare_parameter(
+            "asr_initial_prompt",
+            "以下是普通话的导览对话，常用地点：乐知院、核心力量跑酷、创想谷、"
+            "厕所、跆拳道馆。"
+            "可能的说法：我想去创想谷、带我去厕所、我想练跆拳道、"
+            "回乐知院、去核心力量跑酷。")
+        self.declare_parameter("asr_beam_size", 5)
+        self.declare_parameter("enable_asr", False)
         self.declare_parameter("enable_topic",
                                "/intelligent_interaction/lyre/enable")
         self.declare_parameter("chat_topic", "/tour/chat")
@@ -173,7 +197,8 @@ class TourChat(Node):
         self.declare_parameter("rest_port", 9090)
         self.declare_parameter("map", "消防")
         self.declare_parameter("reloc_poi", "乐知教育")
-        self.declare_parameter("track", "track_line_1003")
+        # 默认点对点：途中经过其它点位不停；需要沿轨迹可设 track_line_1003
+        self.declare_parameter("track", "")
         self.declare_parameter("nav_timeout", 180.0)
         self.declare_parameter("obstacle_text", "正在执行任务，请让一让")
         self.declare_parameter("detour_enabled", True)
@@ -238,6 +263,33 @@ class TourChat(Node):
             String, str(self.get_parameter("chat_topic").value),
             self._on_chat, 10)
 
+        # 唤醒词只登记到平台运行时，不修改系统配置文件；节点退出时还原。
+        # 本地麦克风识别不需要唤醒，开着时就不动平台的唤醒词表。
+        self._mic = None
+        self._wake_client = None
+        self._wake_added = False
+        self._wake_prev = ""
+        if not bool(self.get_parameter("enable_mic").value):
+            threading.Thread(target=self._setup_wakeword, daemon=True).start()
+
+        if bool(self.get_parameter("enable_mic").value):
+            self._mic = MicAsr(
+                self,
+                lambda text: self._enqueue(text, "听到"),
+                mic_topic=str(self.get_parameter("mic_topic").value),
+                control_service=str(self.get_parameter("mic_control_service").value),
+                rate_in=int(self.get_parameter("mic_rate_in").value),
+                vad_threshold=float(self.get_parameter("vad_threshold").value),
+                silence_s=float(self.get_parameter("vad_silence_s").value),
+                model_name=str(self.get_parameter("asr_model").value),
+                compute_type=str(self.get_parameter("asr_compute_type").value),
+                language=str(self.get_parameter("asr_language").value),
+                hotwords=str(self.get_parameter("asr_hotwords").value),
+                initial_prompt=str(self.get_parameter("asr_initial_prompt").value),
+                beam_size=int(self.get_parameter("asr_beam_size").value),
+            )
+            self._mic.start()
+
         # 平台 ASR 默认是关的（asr open status:0），必须持续使能，
         # 一旦停发就会被关回去，表现为「说话没有任何反应」。
         self._enable_pub = None
@@ -261,6 +313,8 @@ class TourChat(Node):
 
         self.get_logger().info(
             f"导览对话已就绪：导航={'开' if self._nav else '关'}，"
+            f"麦克风={'开' if self._mic else '关'}，"
+            f"平台ASR={'开' if self._enable_pub else '关'}，"
             f"模型={self.get_parameter('qwen_model').value}")
 
     # ------------------------------------------------------------- 初始化
@@ -315,11 +369,94 @@ class TourChat(Node):
         msg.data = True
         self._enable_pub.publish(msg)
 
+    def _setup_wakeword(self) -> None:
+        """把唤醒词登记到平台运行时，不改系统配置文件；退出时还原。"""
+        word = str(self.get_parameter("wake_word").value or "").strip()
+        if not word:
+            return
+        try:
+            from lyre_msgs.srv import WakeWordControl
+        except Exception as exc:  # noqa: BLE001 - 没有平台语音时只保留文字
+            self.get_logger().warn(f"唤醒词服务不可用：{exc}")
+            return
+        client = self.create_client(
+            WakeWordControl, "/audio_aiui/wake_word_control")
+        if not client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("唤醒词服务未就绪，跳过登记")
+            return
+        self._wake_client = client
+
+        def call(kind, text=word):
+            request = WakeWordControl.Request()
+            request.type = kind
+            request.word = text
+            done = threading.Event()
+            future = client.call_async(request)
+            future.add_done_callback(lambda _: done.set())
+            if not done.wait(3.0):
+                return None
+            try:
+                return future.result()
+            except Exception:  # noqa: BLE001
+                return None
+
+        listed = call(WakeWordControl.Request.TYPE_LIST)
+        if listed is None or not listed.success:
+            self.get_logger().warn(f"读取唤醒词失败：{listed}")
+            return
+        self._wake_prev = str(listed.current_word or "")
+        if word not in list(listed.words or []):
+            added = call(WakeWordControl.Request.TYPE_ADD)
+            if added is None or not added.success:
+                self.get_logger().warn(f"登记唤醒词失败：{added}")
+                return
+            self._wake_added = True
+        if self._wake_prev != word:
+            picked = call(WakeWordControl.Request.TYPE_SET_CURRENT)
+            if picked is None or not picked.success:
+                self.get_logger().warn(f"切换唤醒词失败：{picked}")
+                return
+        self.get_logger().info(f"语音唤醒词已就绪：{word}")
+        self._file_log("唤醒词", f"已登记 {word}")
+
+    def _restore_wakeword(self) -> None:
+        """退出时把唤醒词列表和当前唤醒词恢复成节点启动前的状态。"""
+        client = self._wake_client
+        word = str(self.get_parameter("wake_word").value or "").strip()
+        if client is None or not word or not client.service_is_ready():
+            return
+        try:
+            from lyre_msgs.srv import WakeWordControl
+        except Exception:  # noqa: BLE001
+            return
+
+        def call(kind, text):
+            request = WakeWordControl.Request()
+            request.type = kind
+            request.word = text
+            done = threading.Event()
+            future = client.call_async(request)
+            future.add_done_callback(lambda _: done.set())
+            done.wait(2.0)
+
+        if self._wake_prev and self._wake_prev != word:
+            call(WakeWordControl.Request.TYPE_SET_CURRENT, self._wake_prev)
+        if self._wake_added:
+            call(WakeWordControl.Request.TYPE_DELETE, word)
+
+    def destroy_node(self):
+        try:
+            self._restore_wakeword()
+        except Exception:  # noqa: BLE001 - 退出路径不再抛错
+            pass
+        return super().destroy_node()
+
     def _on_keyword(self, msg: AsrKeyword) -> None:
         text = str(msg.keyword or "").strip()
         if text:
             self.get_logger().info(
                 f"唤醒词：{text}（声源角度 {msg.angle}°），请继续说")
+            self._file_log("唤醒", f"{text}（{msg.angle}°）")
 
     def _on_asr(self, msg: AsrIat) -> None:
         self._enqueue(msg.text or "", "听到")
@@ -471,7 +608,8 @@ class TourChat(Node):
                 f"开始导航：{place.poi}（{target}，"
                 f"{'回待命点' if standby else '送访客'}）")
             self._file_log("导航", f"{place.poi} {'回待命点' if standby else '送访客'}")
-            self._nav.goto(place.poi)
+            # 去任何点位都先判断方向：目标在身后就先掉头，不倒着走
+            self._nav.goto(place.poi, turn=True)
         except Exception as exc:  # noqa: BLE001 - 导航失败只提示，不退出节点
             self.get_logger().error(f"导航失败：{exc}")
             self._file_log("导航失败", f"{place.poi}：{exc}")
@@ -511,7 +649,14 @@ class TourChat(Node):
         self._last_spoken = text
         self._file_log("播报", text)
         self._speech_until = time.monotonic() + 2.0
-        self._speech.say(text)
+        # 播报期间关掉本地麦克风，避免机器人听见自己的声音
+        if self._mic is not None:
+            self._mic.hold(True)
+        try:
+            self._speech.say(text)
+        finally:
+            if self._mic is not None:
+                self._mic.hold(False)
         # 播完再留 2 秒静默，等喇叭尾音和识别结果过去
         self._speech_until = time.monotonic() + 2.0
 
@@ -526,18 +671,33 @@ class TourChat(Node):
     def _greet(self, text: str) -> None:
         """开机自我介绍：直接播报，绝不走 _handle（自己的话不能当指令）。"""
         time.sleep(2.0)
+        if self._mic is not None:
+            self._mic.hold(True)
         for _ in range(3):
             if self._speech.say(text):
                 self._last_spoken = text
                 self._file_log("播报", text)
                 self._speech_until = time.monotonic() + 2.0
+                if self._mic is not None:
+                    self._mic.hold(False)
                 return
             time.sleep(2.0)
+        if self._mic is not None:
+            self._mic.hold(False)
 
     def shutdown(self) -> None:
         self._closing = True
         self._queue.put(None)
         self._worker.join(timeout=2.0)
+        if self._mic is not None:
+            try:
+                self._mic.stop()
+            except Exception:  # noqa: BLE001 - 退出时上下文可能已失效
+                pass
+        try:
+            self._restore_wakeword()
+        except Exception:  # noqa: BLE001
+            pass
         # 还原本地现场：关闭语音识别
         if self._enable_pub is not None and rclpy.ok():
             msg = Bool()
