@@ -1,4 +1,4 @@
-# 导览机器人语音交互（learn2_Z）
+# 导览机器人语音交互
 
 基于 ROS 2 Jazzy 的展厅导览机器人语音交互工作空间。机器人听懂访客说话，带访客前往展厅点位，到达后询问是否还有事，访客说“没有了”就回到起点待命。
 
@@ -16,23 +16,24 @@
 
 ## 运行环境
 
-| 项 | 值 |
-|---|---|
-| 设备 | Jetson AGX Thor Developer Kit |
-| 系统 | JetPack 7 / aarch64 |
-| ROS | ROS 2 Jazzy（rclpy） |
-| 语音 | 平台讯飞 AIUI（4 麦阵列）+ 平台 TTS |
-| 大模型 | 远程 vLLM（OpenAI 兼容接口） |
-| 底盘 | `robot_controller` SDK，REST 默认 `192.168.11.10:9090` |
+| 项     | 值                                                     |
+| ------ | ------------------------------------------------------ |
+| 设备   | Jetson AGX Thor Developer Kit                          |
+| 系统   | JetPack 7 / aarch64                                    |
+| ROS    | ROS 2 Jazzy（rclpy）                                   |
+| 语音   | 平台讯飞 AIUI（4 麦阵列）+ 平台 TTS                    |
+| 大模型 | 远程 vLLM（OpenAI 兼容接口）                           |
+| 底盘   | `robot_controller` SDK，REST 默认 `192.168.11.10:9090` |
 
 ## 目录结构
 
 ```
 learn2_Z/
 ├── README.md
-├── docx/
+├── docs/
 │   ├── PROJECT_GUIDE.md      # 实现说明
-│   └── TROUBLESHOOTING.md    # 问题与解决记录
+│   ├── images/              # 工作台截图与视频封面
+│   └── videos/              # 实机演示视频
 └── src/nav_pkg/
     ├── config/places.yaml    # 地点别名、待命点、主线配置
     ├── nav_pkg/
@@ -99,12 +100,12 @@ ros2 run nav_pkg tour_chat --ros-args \
 
 默认使用**本地 faster-whisper（small / int8）**，不需要唤醒，前后左右都能听；也可以切回平台 AIUI。
 
-| 项 | 本地模式（默认） | 平台模式 |
-|---|---|---|
-| 开关 | `enable_mic:=true` | `enable_mic:=false`（`enable_asr` 自动为 true 需手动设） |
-| 识别来源 | 订阅 `/lyre/audio_stream`，96k 重采样到 16k | 订阅 `/audio_asr/iat` |
-| 唤醒 | 不需要，能量 VAD 自动断句 | 语音唤醒词「小田」+ 人脸 |
-| 使能 | 无需心跳 | 每 0.5 秒向 `/intelligent_interaction/lyre/enable` 发 `true` |
+| 项       | 本地模式（默认）                            | 平台模式                                                     |
+| -------- | ------------------------------------------- | ------------------------------------------------------------ |
+| 开关     | `enable_mic:=true`                          | `enable_mic:=false`（`enable_asr` 自动为 true 需手动设）     |
+| 识别来源 | 订阅 `/lyre/audio_stream`，96k 重采样到 16k | 订阅 `/audio_asr/iat`                                        |
+| 唤醒     | 不需要，能量 VAD 自动断句                   | 语音唤醒词「小田」+ 人脸                                     |
+| 使能     | 无需心跳                                    | 每 0.5 秒向 `/intelligent_interaction/lyre/enable` 发 `true` |
 
 本地模式用能量 VAD 断句（0.4 秒起说、0.8 秒静音收句、最长 12 秒），播报期间自动静音麦克风，避免机器人听见自己。
 
@@ -112,87 +113,87 @@ ros2 run nav_pkg tour_chat --ros-args \
 
 ## 交互流程
 
-| 场景 | 触发 | 行为 |
-|---|---|---|
-| 明确指令 | “带我去创想谷” | 直接导航 |
-| 模糊表达 | “创想谷” | 反问是否需要带路 |
-| 确认/否认 | “好” / “不用” | 出发 / 放弃 |
-| 间接意图 | “我想练跆拳道” | 大模型推断地点后反问 |
-| 到达 | 导航完成 | 播报并询问“现在还有什么事吗” |
-| 无事 | “没有了 / 没有 / 没事了” | 说“好的，我这就回去”，返回待命点，到点再播报“到了…” |
-| 超时 | 到点后 30 秒无人交互 | 自动说“没什么事了吧，我先回去了”并返回待命点 |
-| 其它 | 任意闲聊 | 大模型自由对话 |
+| 场景      | 触发                     | 行为                                                |
+| --------- | ------------------------ | --------------------------------------------------- |
+| 明确指令  | “带我去创想谷”           | 直接导航                                            |
+| 模糊表达  | “创想谷”                 | 反问是否需要带路                                    |
+| 确认/否认 | “好” / “不用”            | 出发 / 放弃                                         |
+| 间接意图  | “我想练跆拳道”           | 大模型推断地点后反问                                |
+| 到达      | 导航完成                 | 播报并询问“现在还有什么事吗”                        |
+| 无事      | “没有了 / 没有 / 没事了” | 说“好的，我这就回去”，返回待命点，到点再播报“到了…” |
+| 超时      | 到点后 30 秒无人交互     | 自动说“没什么事了吧，我先回去了”并返回待命点        |
+| 其它      | 任意闲聊                 | 大模型自由对话                                      |
 
 导航期间会忽略新的语音输入，避免中途改目标；播报结束后保留短暂静默，防止喇叭尾音被识别成指令。
 
 ## 主要参数
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `asr_topic` | `/audio_asr/iat` | 平台识别结果 |
-| `enable_asr` | `False` | 平台 ASR 使能心跳（本地模式关闭） |
-| `enable_mic` | `True` | 本地麦克风识别开关 |
-| `mic_topic` | `/lyre/audio_stream` | 原始音频 |
-| `asr_model` / `asr_compute_type` | `small` / `int8` | faster-whisper 模型 |
-| `chat_topic` | `/tour/chat` | 文本直连 |
-| `tts_service` | `/intelligent_interaction/tts/play` | 播报服务 |
-| `enable_voice` | `True` | 是否启用 TTS |
-| `enable_greet` | `True` | 启动问候 |
-| `min_chars` | `2` | 最短有效字数 |
-| `dedupe_window` | `2.0` | 去重窗口（秒） |
-| `idle_return_s` | `30.0` | 到点后多久无人交互自动回待命点，`0` 关闭 |
-| `qwen_base_url` | `http://120.48.75.178:7006/v1` | 模型地址 |
-| `qwen_model` | `Qwen3.5-122B-A10B` | 模型名 |
-| `qwen_timeout` | `30.0` | 请求超时 |
-| `history_turns` | `6` | 闲聊历史轮数 |
-| `enable_nav` | `True` | 是否启用导航 |
-| `host` / `rest_port` | `192.168.11.10` / `9090` | 底盘 REST |
-| `map` | `消防` | 地图名 |
-| `wake_word` | `小田` | 运行时登记的语音唤醒词，留空则不登记 |
-| `reloc_poi` | `乐知教育` | 重定位参考点 |
-| `track` | `""`（点对点） | 虚拟轨道；设为 `track_line_1003` 恢复轨道导航 |
-| `nav_timeout` | `180.0` | 单次导航超时 |
-| `detour_enabled` | `True` | 障碍长时间不动时是否尝试小步绕行 |
-| `detour_after_s` | `1.0` | 两遍提示后仍被挡，再等多少秒就绕行 |
-| `obstacle_text` | `正在执行任务，请让一让` | 检测到障碍时的播报内容，间隔 1 秒，共两遍 |
-| `detour_side_m` | `0.4` | 侧移距离（米，上限 0.5） |
-| `detour_fwd_m` | `0.6` | 绕行后前进距离（米，上限 1.0） |
-| `detour_clear_m` | `1.0` | 侧方最小净空，不足则不动 |
-| `detour_max_tries` | `2` | 单次导航最多绕行次数 |
-| `detour_side_sign` | `1.0` | 侧移方向符号，方向反了改 `-1.0` |
-| `depth_topic` | `/ob_camera_head/depth/image_raw` | 判断左右净空的深度图 |
-| `places_file` | `""` | 空则使用包内 `config/places.yaml` |
-| `log_file` | `""` | 空则写入 `~/guide_logs/` |
+| 参数                             | 默认                                | 说明                                          |
+| -------------------------------- | ----------------------------------- | --------------------------------------------- |
+| `asr_topic`                      | `/audio_asr/iat`                    | 平台识别结果                                  |
+| `enable_asr`                     | `False`                             | 平台 ASR 使能心跳（本地模式关闭）             |
+| `enable_mic`                     | `True`                              | 本地麦克风识别开关                            |
+| `mic_topic`                      | `/lyre/audio_stream`                | 原始音频                                      |
+| `asr_model` / `asr_compute_type` | `small` / `int8`                    | faster-whisper 模型                           |
+| `chat_topic`                     | `/tour/chat`                        | 文本直连                                      |
+| `tts_service`                    | `/intelligent_interaction/tts/play` | 播报服务                                      |
+| `enable_voice`                   | `True`                              | 是否启用 TTS                                  |
+| `enable_greet`                   | `True`                              | 启动问候                                      |
+| `min_chars`                      | `2`                                 | 最短有效字数                                  |
+| `dedupe_window`                  | `2.0`                               | 去重窗口（秒）                                |
+| `idle_return_s`                  | `30.0`                              | 到点后多久无人交互自动回待命点，`0` 关闭      |
+| `qwen_base_url`                  | `http://120.48.75.178:7006/v1`      | 模型地址                                      |
+| `qwen_model`                     | `Qwen3.5-122B-A10B`                 | 模型名                                        |
+| `qwen_timeout`                   | `30.0`                              | 请求超时                                      |
+| `history_turns`                  | `6`                                 | 闲聊历史轮数                                  |
+| `enable_nav`                     | `True`                              | 是否启用导航                                  |
+| `host` / `rest_port`             | `192.168.11.10` / `9090`            | 底盘 REST                                     |
+| `map`                            | `消防`                              | 地图名                                        |
+| `wake_word`                      | `小田`                              | 运行时登记的语音唤醒词，留空则不登记          |
+| `reloc_poi`                      | `乐知教育`                          | 重定位参考点                                  |
+| `track`                          | `""`（点对点）                      | 虚拟轨道；设为 `track_line_1003` 恢复轨道导航 |
+| `nav_timeout`                    | `180.0`                             | 单次导航超时                                  |
+| `detour_enabled`                 | `True`                              | 障碍长时间不动时是否尝试小步绕行              |
+| `detour_after_s`                 | `1.0`                               | 两遍提示后仍被挡，再等多少秒就绕行            |
+| `obstacle_text`                  | `正在执行任务，请让一让`            | 检测到障碍时的播报内容，间隔 1 秒，共两遍     |
+| `detour_side_m`                  | `0.4`                               | 侧移距离（米，上限 0.5）                      |
+| `detour_fwd_m`                   | `0.6`                               | 绕行后前进距离（米，上限 1.0）                |
+| `detour_clear_m`                 | `1.0`                               | 侧方最小净空，不足则不动                      |
+| `detour_max_tries`               | `2`                                 | 单次导航最多绕行次数                          |
+| `detour_side_sign`               | `1.0`                               | 侧移方向符号，方向反了改 `-1.0`               |
+| `depth_topic`                    | `/ob_camera_head/depth/image_raw`   | 判断左右净空的深度图                          |
+| `places_file`                    | `""`                                | 空则使用包内 `config/places.yaml`             |
+| `log_file`                       | `""`                                | 空则写入 `~/guide_logs/`                      |
 
 ## 对外接口
 
 订阅：
 
-| 话题 | 类型 | 用途 |
-|---|---|---|
-| `/audio_asr/iat` | `lyre_msgs/AsrIat` | 语音识别文字 |
-| `/audio_asr/keyword` | `lyre_msgs/AsrKeyword` | 唤醒事件 |
-| `/tour/chat` | `std_msgs/String` | 文本输入 |
+| 话题                 | 类型                   | 用途         |
+| -------------------- | ---------------------- | ------------ |
+| `/audio_asr/iat`     | `lyre_msgs/AsrIat`     | 语音识别文字 |
+| `/audio_asr/keyword` | `lyre_msgs/AsrKeyword` | 唤醒事件     |
+| `/tour/chat`         | `std_msgs/String`      | 文本输入     |
 
 发布：
 
-| 话题 | 类型 | 用途 |
-|---|---|---|
+| 话题                                   | 类型            | 用途         |
+| -------------------------------------- | --------------- | ------------ |
 | `/intelligent_interaction/lyre/enable` | `std_msgs/Bool` | ASR 使能心跳 |
 
 服务：
 
-| 服务 | 类型 | 用途 |
-|---|---|---|
+| 服务                                | 类型                          | 用途           |
+| ----------------------------------- | ----------------------------- | -------------- |
 | `/intelligent_interaction/tts/play` | `interaction_msgs/TtsService` | append / query |
 
 外部 HTTP：
 
-| 目标 | 端点 |
-|---|---|
-| 大模型 | `POST {qwen_base_url}/chat/completions` |
+| 目标     | 端点                                             |
+| -------- | ------------------------------------------------ |
+| 大模型   | `POST {qwen_base_url}/chat/completions`          |
 | 底盘导航 | `PUT /api/core/navigation/v1/actions/moveto_poi` |
-| 底盘状态 | `GET /api/core/motion/v1/actions/{action_id}` |
+| 底盘状态 | `GET /api/core/motion/v1/actions/{action_id}`    |
 
 ## 地点配置
 
@@ -224,28 +225,55 @@ aliases:
 
 ## 已知限制
 
-| # | 限制 | 影响 |
-|---|---|---|
-| 1 | 模型请求无重试、无备用端点 | 网络抖动即失联 |
-| 2 | 模型服务为明文 HTTP 且无鉴权 | 存在被滥用风险 |
-| 3 | 模型超时 30 秒偏长 | 排队阻塞体验差 |
-| 4 | 对话历史不重置 | 跨访客上下文可能串味 |
-| 5 | `main_line` / `branches` 未接入导航 | 无法逐点巡线讲解 |
-| 6 | 平台 ASR 仅前向拾音 | 侧后方说话无效 |
-| 7 | 导航期间忽略新指令 | 需到点后再下新目标 |
+| #   | 限制                                | 影响                 |
+| --- | ----------------------------------- | -------------------- |
+| 1   | 模型请求无重试、无备用端点          | 网络抖动即失联       |
+| 2   | 模型服务为明文 HTTP 且无鉴权        | 存在被滥用风险       |
+| 3   | 模型超时 30 秒偏长                  | 排队阻塞体验差       |
+| 4   | 对话历史不重置                      | 跨访客上下文可能串味 |
+| 5   | `main_line` / `branches` 未接入导航 | 无法逐点巡线讲解     |
+| 6   | 平台 ASR 仅前向拾音                 | 侧后方说话无效       |
+| 7   | 导航期间忽略新指令                  | 需到点后再下新目标   |
+
+## 实机演示视频
+
+机器人在走廊中的实机演示，时长约 71 秒。点击封面打开 MP4 视频（约 14 MB）。
+
+[![机器人实机演示](docs/images/robot-demo-cover.jpg)](docs/videos/robot-demo.mp4)
+
+[打开或下载演示视频](docs/videos/robot-demo.mp4)
+
+## 工作台截图
+
+实机监控页面截图；截图时语音导览节点尚未启动。
+
+### 总览
+
+![总览](docs/images/dashboard-overview.png)
+
+### 设备状态
+
+![设备状态](docs/images/dashboard-devices.png)
+
+### 节点状态
+
+![节点状态](docs/images/dashboard-nodes.png)
+
+### 地图配置
+
+![地图配置](docs/images/dashboard-map.png)
 
 ## 相关文档
 
-- [PROJECT_GUIDE.md](docx/PROJECT_GUIDE.md)：实现说明与设计决策
-- [TROUBLESHOOTING.md](docx/TROUBLESHOOTING.md)：实际遇到的问题与排查方法
+- [PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md)：实现说明与设计决策
 
 ## 常见问题
 
-| 现象 | 排查 |
-|---|---|
-| 说话完全没反应 | 确认 `/intelligent_interaction/lyre/enable` 每 0.5s 有 `true`，并已唤醒 |
-| 有识别但不回应 | 可能处于导航/播报中，被“忙”过滤 |
-| 大模型无回应 | 检查模型服务可达性，查看日志错误 |
-| 不动 | 底盘健康检查未通过或定位未就绪 |
-| 走一半停下 | 先间隔 1 秒播报两遍“正在执行任务，请让一让”，仍被挡就尝试小步绕行（侧移 0.4m + 前进 0.6m，最多 2 次）；两侧净空不足则停车继续等 |
-| 到点报失败 | 已按 1 米容差兜底，可适当放宽 |
+| 现象           | 排查                                                                                                                            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| 说话完全没反应 | 确认 `/intelligent_interaction/lyre/enable` 每 0.5s 有 `true`，并已唤醒                                                         |
+| 有识别但不回应 | 可能处于导航/播报中，被“忙”过滤                                                                                                 |
+| 大模型无回应   | 检查模型服务可达性，查看日志错误                                                                                                |
+| 不动           | 底盘健康检查未通过或定位未就绪                                                                                                  |
+| 走一半停下     | 先间隔 1 秒播报两遍“正在执行任务，请让一让”，仍被挡就尝试小步绕行（侧移 0.4m + 前进 0.6m，最多 2 次）；两侧净空不足则停车继续等 |
+| 到点报失败     | 已按 1 米容差兜底，可适当放宽                                                                                                   |
